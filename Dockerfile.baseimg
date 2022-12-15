@@ -1,0 +1,16 @@
+FROM fedora:latest
+
+RUN curl "https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz" -o "rosa-linux.tar.gz"
+RUN tar xvf rosa-linux.tar.gz --no-same-owner
+RUN sudo mv rosa /usr/local/bin/rosa
+
+RUN sudo dnf install -y unzip
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+RUN unzip awscliv2.zip
+RUN sudo ./aws/install
+
+# RUN sudo dnf install -y origin-clients
+
+RUN curl "https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz" -o "oc.tar.gz"
+RUN tar xvf oc.tar.gz --no-same-owner
+RUN sudo mv oc /usr/local/bin/oc
