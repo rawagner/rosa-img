@@ -15,18 +15,22 @@ import (
 	ct "github.com/stolostron/cluster-templates-operator/api/v1alpha1"
 	"github.com/stolostron/cluster-templates-operator/clusterprovider"
 	"gopkg.in/yaml.v3"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	mce "open-cluster-management.io/api/cluster/v1"
 )
 
 type AdminCreds struct {
@@ -47,7 +51,7 @@ type ClusterDescribe struct {
 	Name   string        `json:"string"`
 }
 
-const PodFinalizer = "rosa.openshift.io/finalizer"
+const ROSAFinalizer = "rosa.openshift.io/finalizer"
 
 type RosaReconciler struct {
 	client.Client
@@ -59,48 +63,77 @@ func (r *RosaReconciler) Reconcile(
 	ctx context.Context,
 	req ctrl.Request,
 ) (ctrl.Result, error) {
-	pod := &corev1.Pod{}
-	if err := r.Get(ctx, req.NamespacedName, pod); err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
+	fmt.Println("Reconcile")
+	fmt.Println(req)
+	app := &argo.Application{}
+	if err := r.Client.Get(
+		context.TODO(),
+		types.NamespacedName{
+			Name:      os.Getenv("CLUSTER_NAME"),
+			Namespace: "argocd", //os.Getenv("CLUSTER_NAMESPACE"), TODO - Release.Namespace is destination.namespace ??
+		},
+		app,
+	); err != nil {
+		fmt.Println(err.Error())
 		return ctrl.Result{}, err
 	}
-	if pod.GetName() != os.Getenv("POD_NAME") || pod.GetNamespace() != os.Getenv("POD_NAMESPACE") {
-		return ctrl.Result{}, nil
+
+	ctiName := app.Labels[ct.CTINameLabel]
+	ctiNamespace := app.Labels[ct.CTINamespaceLabel]
+
+	cti := &ct.ClusterTemplateInstance{}
+	if err := r.Client.Get(
+		context.TODO(),
+		types.NamespacedName{
+			Name:      ctiName,
+			Namespace: ctiNamespace,
+		},
+		cti,
+	); err != nil {
+		fmt.Println("2")
+		fmt.Println(err.Error())
+		return ctrl.Result{}, err
 	}
+
+	//delete event
+	if req.NamespacedName.Name != "" && req.NamespacedName.Namespace != "" {
+		if cti.GetName() == req.NamespacedName.Name && cti.GetNamespace() == req.NamespacedName.Namespace {
+			cmdDelete := exec.Command(
+				"rosa", "delete", "cluster",
+				"--region", os.Getenv("AWS_REGION"),
+				"-c", os.Getenv("CLUSTER_NAME"),
+				"-y",
+			)
+			err := runCmd(cmdDelete)
+			if err != nil {
+				fmt.Println(err)
+				return ctrl.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(
+				cti,
+				ROSAFinalizer,
+			)
+			if err := r.Update(ctx, cti); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
+	}
+
+	if !controllerutil.ContainsFinalizer(cti, ROSAFinalizer) {
+		fmt.Println("Add finalizer")
+		cti.Finalizers = append(cti.Finalizers, ROSAFinalizer)
+		if err := r.Client.Update(ctx, cti); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	fmt.Println("Logging into ROSA")
 	cmd := exec.Command("rosa", "login", "--token", os.Getenv("ROSA_TOKEN"))
 
 	err := runCmd(cmd)
 	if err != nil {
 		return ctrl.Result{}, err
-	}
-
-	if pod.GetDeletionTimestamp() != nil {
-		if controllerutil.ContainsFinalizer(
-			pod,
-			PodFinalizer,
-		) {
-			cmdDelete := exec.Command(
-				"rosa", "delete", "cluster",
-				"--region", os.Getenv("AWS_REGION"),
-				"-c", os.Getenv("CLUSTER_NAME"),
-			)
-			err = runCmd(cmdDelete)
-			if err != nil {
-				fmt.Println(err)
-				return ctrl.Result{}, err
-			}
-			controllerutil.RemoveFinalizer(
-				pod,
-				PodFinalizer,
-			)
-			if err := r.Update(ctx, pod); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
-		}
 	}
 
 	fmt.Println("find ROSA cluster")
@@ -138,6 +171,8 @@ func (r *RosaReconciler) Reconcile(
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	} else {
+		fmt.Println("ROSA cluster already exists")
 	}
 
 	fmt.Println("Get ROSA cluster status")
@@ -171,55 +206,25 @@ func (r *RosaReconciler) Reconcile(
 
 	out, err = cmd.Output()
 	if err != nil {
+		fmt.Println("err creating cluster admin")
+		fmt.Println(err.Error())
+		fmt.Println(out)
 		return ctrl.Result{}, err
 	}
 
 	adminCreds := &AdminCreds{}
 	err = yaml.Unmarshal(out, adminCreds)
 	if err != nil {
+		fmt.Println("err unmarshalling creds")
+		fmt.Println("out: " + string(out))
+		fmt.Println(err.Error())
 		return ctrl.Result{}, err
 	}
 
 	fmt.Println("Cluster installed!")
 
-	app := &argo.Application{}
-	err = r.Client.Get(
-		context.TODO(),
-		types.NamespacedName{
-			Name:      os.Getenv("CLUSTER_NAME"),
-			Namespace: os.Getenv("CLUSTER_NAMESPACE"),
-		},
-		app,
-	)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	ctiName := app.Labels[ct.CTINameLabel]
-	ctiNamespace := app.Labels[ct.CTINamespaceLabel]
-
-	cti := &ct.ClusterTemplateInstance{}
-	err = r.Client.Get(
-		context.TODO(),
-		types.NamespacedName{
-			Name:      ctiName,
-			Namespace: ctiNamespace,
-		},
-		cti,
-	)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	/*
-		cti := &ct.ClusterTemplateInstance{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "rosa-x1",
-				Namespace: "devuserns",
-			},
-		}
-		ctiName := "rosa-x1"
-	*/
-
+	fmt.Println("Wait before cluster login")
+	time.Sleep(5 * time.Minute)
 	newClusterClient := getClientForNewCluster(
 		clusterDescribe.API.URL,
 		adminCreds.Username,
@@ -361,6 +366,57 @@ func (r *RosaReconciler) Reconcile(
 		return ctrl.Result{}, err
 	}
 
+	fmt.Println("Import cluster")
+
+	mc := &mce.ManagedCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ctiName,
+			Labels: map[string]string{
+				"name":   ctiName,
+				"cloud":  "Amazon",
+				"vendor": "OpenShift",
+			},
+		},
+		Spec: mce.ManagedClusterSpec{
+			HubAcceptsClient: true,
+		},
+	}
+
+	if err := r.Client.Create(ctx, mc); err != nil {
+		fmt.Println("failed to create mc")
+		fmt.Println(err.Error())
+		return ctrl.Result{}, err
+	}
+
+	mcNs := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: ctiName,
+		},
+	}
+
+	if err := r.Client.Create(ctx, mcNs); err != nil {
+		fmt.Println("failed to create mc ns")
+		fmt.Println(err.Error())
+	}
+
+	mcSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "auto-import-secret",
+			Namespace: ctiName,
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			"autoImportRetry": []byte("2"),
+			"kubeconfig":      kubeconfigBytes,
+		},
+	}
+
+	if err := r.Client.Create(ctx, mcSecret); err != nil {
+		fmt.Println("failed to create mc secret")
+		fmt.Println(err.Error())
+		return ctrl.Result{}, err
+	}
+
 	cti.SetClusterInstallCondition(
 		metav1.ConditionTrue,
 		ct.ClusterInstalled,
@@ -372,31 +428,50 @@ func (r *RosaReconciler) Reconcile(
 }
 
 func (r *RosaReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	/*
-		mapPod := func(pod client.Object) []reconcile.Request {
-			reply := []reconcile.Request{}
-			if pod.GetName() == os.Getenv("POD_NAME") && pod.GetNamespace() == os.Getenv("POD_NAMESPACE") {
-				reply = append(reply, reconcile.Request{NamespacedName: types.NamespacedName{
-					Namespace: pod.GetNamespace(),
-					Name:      pod.GetName(),
-				}})
-			}
-			return reply
-		}
-	*/
-
-	err := ctrl.NewControllerManagedBy(mgr).
-		For(&corev1.Pod{}).Complete(r)
-
+	fmt.Println("Setup with manager")
 	initialSync := make(chan event.GenericEvent)
-	go func() {
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      os.Getenv("POD_NAME"),
-				Namespace: os.Getenv("POD_NAMESPACE"),
+	err := ctrl.NewControllerManagedBy(mgr).
+		For(&ct.ClusterTemplateInstance{}, builder.Predicates{}).
+		WithEventFilter(predicate.Funcs{
+			CreateFunc: func(e event.CreateEvent) bool {
+				fmt.Println("Create")
+				fmt.Println(e.Object)
+				fmt.Println("----")
+				return false
 			},
-		}
-		initialSync <- event.GenericEvent{Object: pod}
+			UpdateFunc: func(e event.UpdateEvent) bool {
+				fmt.Println("Update")
+				fmt.Println(e.ObjectNew)
+				fmt.Println("----")
+				annotations := e.ObjectNew.GetAnnotations()
+				if annotations != nil {
+					_, ok := annotations[clusterprovider.ClusterProviderExperimentalAnnotation]
+					return ok &&
+						e.ObjectNew.GetDeletionTimestamp() != nil &&
+						controllerutil.ContainsFinalizer(e.ObjectNew, ROSAFinalizer)
+				}
+				return false
+			},
+			DeleteFunc: func(e event.DeleteEvent) bool {
+				fmt.Println("Delete")
+				fmt.Println(e.Object)
+				fmt.Println("----")
+				return false
+			},
+			GenericFunc: func(e event.GenericEvent) bool {
+				fmt.Println("Generic")
+				fmt.Println(e.Object)
+				fmt.Println("----")
+				return e.Object.GetName() == "" && e.Object.GetNamespace() == ""
+			},
+		}).
+		Watches(&source.Channel{Source: initialSync}, &handler.EnqueueRequestForObject{}).
+		Complete(r)
+
+	go func() {
+		fmt.Println("Init sync run")
+		initialSync <- event.GenericEvent{Object: &ct.ClusterTemplateInstance{}}
+		fmt.Println("Init sync sent")
 	}()
 	return err
 }
