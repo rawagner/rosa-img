@@ -30,7 +30,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	mce "open-cluster-management.io/api/cluster/v1"
 )
 
 type AdminCreds struct {
@@ -363,57 +362,6 @@ func (r *RosaReconciler) Reconcile(
 	)
 
 	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	fmt.Println("Import cluster")
-
-	mc := &mce.ManagedCluster{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: ctiName,
-			Labels: map[string]string{
-				"name":   ctiName,
-				"cloud":  "Amazon",
-				"vendor": "OpenShift",
-			},
-		},
-		Spec: mce.ManagedClusterSpec{
-			HubAcceptsClient: true,
-		},
-	}
-
-	if err := r.Client.Create(ctx, mc); err != nil {
-		fmt.Println("failed to create mc")
-		fmt.Println(err.Error())
-		return ctrl.Result{}, err
-	}
-
-	mcNs := &corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: ctiName,
-		},
-	}
-
-	if err := r.Client.Create(ctx, mcNs); err != nil {
-		fmt.Println("failed to create mc ns")
-		fmt.Println(err.Error())
-	}
-
-	mcSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "auto-import-secret",
-			Namespace: ctiName,
-		},
-		Type: corev1.SecretTypeOpaque,
-		Data: map[string][]byte{
-			"autoImportRetry": []byte("2"),
-			"kubeconfig":      kubeconfigBytes,
-		},
-	}
-
-	if err := r.Client.Create(ctx, mcSecret); err != nil {
-		fmt.Println("failed to create mc secret")
-		fmt.Println(err.Error())
 		return ctrl.Result{}, err
 	}
 
