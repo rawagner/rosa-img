@@ -58,18 +58,27 @@ type RosaReconciler struct {
 	EnableHypershift bool
 }
 
+func getEnv(key, fallback string) string {
+	value, exists := os.LookupEnv(key)
+	if !exists {
+		value = fallback
+	}
+	return value
+}
+
 func (r *RosaReconciler) Reconcile(
 	ctx context.Context,
 	req ctrl.Request,
 ) (ctrl.Result, error) {
 	fmt.Println("Reconcile")
 	fmt.Println(req)
+
 	app := &argo.Application{}
 	if err := r.Client.Get(
 		context.TODO(),
 		types.NamespacedName{
 			Name:      os.Getenv("CLUSTER_NAME"),
-			Namespace: "argocd", //os.Getenv("CLUSTER_NAMESPACE"), TODO - Release.Namespace is destination.namespace ??
+			Namespace: getEnv("ARGO_NAMESPACE", "cluster-aas-operator"),
 		},
 		app,
 	); err != nil {
@@ -79,6 +88,8 @@ func (r *RosaReconciler) Reconcile(
 
 	ctiName := app.Labels[ct.CTINameLabel]
 	ctiNamespace := app.Labels[ct.CTINamespaceLabel]
+
+	clusterName := ctiName + "-" + app.Name[:3]
 
 	cti := &ct.ClusterTemplateInstance{}
 	if err := r.Client.Get(
@@ -100,7 +111,7 @@ func (r *RosaReconciler) Reconcile(
 			cmdDelete := exec.Command(
 				"rosa", "delete", "cluster",
 				"--region", os.Getenv("AWS_REGION"),
-				"-c", os.Getenv("CLUSTER_NAME"),
+				"-c", clusterName,
 				"-y",
 			)
 			err := runCmd(cmdDelete)
@@ -153,7 +164,7 @@ func (r *RosaReconciler) Reconcile(
 	}
 	found := false
 	for _, cluster := range clusterList {
-		if cluster.Name == os.Getenv("CLUSTER_NAME") {
+		if cluster.Name == clusterName {
 			found = true
 		}
 	}
@@ -163,7 +174,7 @@ func (r *RosaReconciler) Reconcile(
 		cmd = exec.Command(
 			"rosa", "create", "cluster",
 			"--region", os.Getenv("AWS_REGION"),
-			"--cluster-name", os.Getenv("CLUSTER_NAME"),
+			"--cluster-name", clusterName,
 		)
 		err = runCmd(cmd)
 		if err != nil {
@@ -178,7 +189,7 @@ func (r *RosaReconciler) Reconcile(
 	clusterDescribe := &ClusterDescribe{}
 	cmd = exec.Command(
 		"rosa", "describe", "cluster",
-		"-c", os.Getenv("CLUSTER_NAME"),
+		"-c", clusterName,
 		"-o", "yaml",
 	)
 	out, err = cmd.Output()
@@ -198,7 +209,7 @@ func (r *RosaReconciler) Reconcile(
 	fmt.Println("Create admin user")
 	cmd = exec.Command(
 		"rosa", "create", "admin",
-		"-c", os.Getenv("CLUSTER_NAME"),
+		"-c", clusterName,
 		"--region", os.Getenv("AWS_REGION"),
 		"-o", "yaml",
 	)
